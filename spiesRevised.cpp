@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -15,6 +16,51 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <Random123/philox.h>
+
+class Random123Rng {
+public:
+    using result_type = std::uint64_t;
+
+    Random123Rng(std::uint64_t seed, std::uint64_t stream) {
+        key_.v[0] = static_cast<std::uint32_t>(seed);
+        key_.v[1] = static_cast<std::uint32_t>(seed >> 32);
+        key_.v[1] ^= static_cast<std::uint32_t>(stream);
+        counter_.v[0] = static_cast<std::uint32_t>(stream);
+        counter_.v[1] = static_cast<std::uint32_t>(stream >> 32);
+        counter_.v[2] = 0;
+        counter_.v[3] = 0;
+    }
+
+    static constexpr result_type min() { return std::numeric_limits<result_type>::min(); }
+    static constexpr result_type max() { return std::numeric_limits<result_type>::max(); }
+
+    result_type operator()() {
+        if (bufferIndex_ >= buffer_.size()) refill();
+        return buffer_[bufferIndex_++];
+    }
+
+    double uniform01() {
+        constexpr long double denom = static_cast<long double>(std::numeric_limits<result_type>::max()) + 1.0L;
+        return static_cast<long double>((*this)()) / denom;
+    }
+
+private:
+    void refill() {
+        auto res = generator_(counter_, key_);
+        counter_.v[0]++;
+        buffer_[0] = (static_cast<std::uint64_t>(res.v[0]) << 32) | res.v[1];
+        buffer_[1] = (static_cast<std::uint64_t>(res.v[2]) << 32) | res.v[3];
+        bufferIndex_ = 0;
+    }
+
+    r123::Philox4x32 generator_{};
+    r123::Philox4x32::key_type key_{};
+    r123::Philox4x32::ctr_type counter_{};
+    std::array<std::uint64_t, 2> buffer_{};
+    std::size_t bufferIndex_{2};
+};
 
 struct Position {
     int row;  // 1-indexed
@@ -222,7 +268,7 @@ int swapScore(int n, int r1, int c1, int r2, int c2,
     return conflictsAfter(r1, c2) + conflictsAfter(r2, c1);
 }
 
-bool attemptSolve(std::vector<int> perm, std::mt19937_64 &rng, int maxIterations, std::vector<int> &out) {
+bool attemptSolve(std::vector<int> perm, Random123Rng &rng, int maxIterations, std::vector<int> &out) {
     const int n = static_cast<int>(perm.size());
     std::vector<int> diagMain(2 * n, 0), diagAnti(2 * n, 0);
     auto diagIdx = [](int row, int col) { return row + col; };
@@ -318,7 +364,7 @@ bool attemptSolve(std::vector<int> perm, std::mt19937_64 &rng, int maxIterations
     return false;
 }
 
-bool solveQueens(int n, std::mt19937_64 &rng, const SearchConfig &config, std::vector<int> &out) {
+bool solveQueens(int n, Random123Rng &rng, const SearchConfig &config, std::vector<int> &out) {
     std::vector<int> base(n);
     std::iota(base.begin(), base.end(), 0);
     for (int attempt = 0; attempt < config.maxRestarts; ++attempt) {
@@ -331,7 +377,7 @@ bool solveQueens(int n, std::mt19937_64 &rng, const SearchConfig &config, std::v
     return false;
 }
 
-bool enforceCollinearity(std::vector<int> &perm, std::mt19937_64 &rng, int multiplier = 40) {
+bool enforceCollinearity(std::vector<int> &perm, Random123Rng &rng, int multiplier = 40) {
     const int n = static_cast<int>(perm.size());
     std::vector<int> diagMain(2 * n, -1);
     std::vector<int> diagAnti(2 * n, -1);
@@ -356,8 +402,6 @@ bool enforceCollinearity(std::vector<int> &perm, std::mt19937_64 &rng, int multi
     }
 
     const long long maxSteps = static_cast<long long>(n) * n * multiplier;
-    std::uniform_real_distribution<double> prob(0.0, 1.0);
-
     auto diagFreeAfterSwap = [&](int row, int newCol, int allowedRow) {
         int idxMain = mainIdx(row, newCol);
         int idxAnti = antiIdx(row, newCol);
@@ -415,7 +459,7 @@ bool enforceCollinearity(std::vector<int> &perm, std::mt19937_64 &rng, int multi
         if (!accept && temperature > 0.0) {
             double p = std::exp(static_cast<double>(beforeCost - afterCost) /
                                 std::max(temperature, 1e-9));
-            if (prob(rng) < p) accept = true;
+            if (rng.uniform01() < p) accept = true;
         }
 
         if (!accept) {
@@ -519,10 +563,12 @@ bool enforceCollinearity(std::vector<int> &perm, std::mt19937_64 &rng, int multi
 }
 
 void searchWorker(int workerId, int n, const SearchConfig &config,
-                  bool skipCollinearity,
+                  bool skipCollinearity, std::uint64_t seedBase,
                   std::atomic<bool> &solved, std::vector<int> &solution,
                   std::mutex &solutionMutex, std::atomic<std::uint64_t> &attempts) {
-    std::mt19937_64 rng(std::random_device{}() ^ (static_cast<std::uint64_t>(workerId) << 32));
+    constexpr std::uint64_t kStreamSpacing = 0x9e3779b97f4a7c15ull;
+    std::uint64_t workerSeed = seedBase + kStreamSpacing * static_cast<std::uint64_t>(workerId);
+    Random123Rng rng(workerSeed, static_cast<std::uint64_t>(workerId));
     while (!solved.load(std::memory_order_relaxed)) {
         std::vector<int> perm;
         if (!solveQueens(n, rng, config, perm)) {
@@ -584,13 +630,25 @@ int main(int argc, char *argv[]) {
     const unsigned int hw = std::thread::hardware_concurrency();
     const unsigned int numThreads = std::max(2u, hw == 0 ? 2u : hw);
 
+    auto deriveSeed = []() {
+        std::random_device rd;
+        std::uint64_t hi = static_cast<std::uint64_t>(rd()) << 32;
+        std::uint64_t lo = static_cast<std::uint64_t>(rd());
+        std::uint64_t timeComponent =
+            static_cast<std::uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        std::uint64_t seed = hi ^ lo ^ timeComponent;
+        if (seed == 0) seed = 0x123456789abcdefULL;
+        return seed;
+    };
+    const std::uint64_t seedBase = deriveSeed();
+
     std::vector<std::thread> workers;
     workers.reserve(numThreads);
 
     auto start = std::chrono::steady_clock::now();
     for (unsigned int i = 0; i < numThreads; ++i) {
         workers.emplace_back(searchWorker, static_cast<int>(i), N, std::cref(config),
-                             skipCollinearity,
+                             skipCollinearity, seedBase,
                              std::ref(solved), std::ref(solution), std::ref(solutionMutex), std::ref(attempts));
     }
     for (auto &t : workers) {
