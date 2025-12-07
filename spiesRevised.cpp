@@ -1,13 +1,8 @@
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <functional>
 #include <iostream>
-#include <limits>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -16,72 +11,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <Random123/philox.h>
-
-class Random123Rng {
-public:
-    using result_type = std::uint64_t;
-
-    Random123Rng(std::uint64_t seed, std::uint64_t stream) {
-        key_.v[0] = static_cast<std::uint32_t>(seed);
-        key_.v[1] = static_cast<std::uint32_t>(seed >> 32);
-        key_.v[1] ^= static_cast<std::uint32_t>(stream);
-        counter_.v[0] = static_cast<std::uint32_t>(stream);
-        counter_.v[1] = static_cast<std::uint32_t>(stream >> 32);
-        counter_.v[2] = 0;
-        counter_.v[3] = 0;
-    }
-
-    static constexpr result_type min() { return std::numeric_limits<result_type>::min(); }
-    static constexpr result_type max() { return std::numeric_limits<result_type>::max(); }
-
-    result_type operator()() {
-        if (bufferIndex_ >= buffer_.size()) refill();
-        return buffer_[bufferIndex_++];
-    }
-
-    double uniform01() {
-        constexpr long double denom = static_cast<long double>(std::numeric_limits<result_type>::max()) + 1.0L;
-        return static_cast<long double>((*this)()) / denom;
-    }
-
-private:
-    void refill() {
-        auto res = generator_(counter_, key_);
-        counter_.v[0]++;
-        buffer_[0] = (static_cast<std::uint64_t>(res.v[0]) << 32) | res.v[1];
-        buffer_[1] = (static_cast<std::uint64_t>(res.v[2]) << 32) | res.v[3];
-        bufferIndex_ = 0;
-    }
-
-    r123::Philox4x32 generator_{};
-    r123::Philox4x32::key_type key_{};
-    r123::Philox4x32::ctr_type counter_{};
-    std::array<std::uint64_t, 2> buffer_{};
-    std::size_t bufferIndex_{2};
-};
-
-struct Position {
-    int row;  // 1-indexed
-    int col;  // 1-indexed
-    std::string notation;
-};
-
-std::string columnToLetters(int col) {
-    std::string letters;
-    while (col > 0) {
-        col--;
-        letters.push_back(static_cast<char>('a' + (col % 26)));
-        col /= 26;
-    }
-    std::reverse(letters.begin(), letters.end());
-    return letters;
-}
-
-std::string toChess(int row, int col) {
-    return columnToLetters(col) + std::to_string(row);
-}
 
 struct LineKey {
     int a{0};
@@ -101,7 +30,7 @@ struct LineHash {
     }
 };
 
-LineKey makeLineKey(int x1, int y1, int x2, int y2) {
+static LineKey makeLineKey(int x1, int y1, int x2, int y2) {
     long long A = static_cast<long long>(y2) - static_cast<long long>(y1);
     long long B = static_cast<long long>(x1) - static_cast<long long>(x2);
     long long C = static_cast<long long>(x2) * y1 - static_cast<long long>(x1) * y2;
@@ -123,552 +52,385 @@ struct ValidationResult {
     std::string message;
 };
 
-ValidationResult validatePermutation(const std::vector<int> &perm) {
-    const int n = static_cast<int>(perm.size());
-    std::vector<Position> positions;
-    positions.reserve(n);
-    for (int row = 0; row < n; ++row) {
-        int col = perm[row];
-        positions.push_back({row + 1, col + 1, toChess(row + 1, col + 1)});
-    }
+static ValidationResult validatePlacement(const std::vector<int> &rowsPerColumn) {
+    const int n = static_cast<int>(rowsPerColumn.size());
+    std::vector<char> rowUsed(n, 0), colUsed(n, 0);
+    std::vector<char> diagMain(2 * n + 3, 0), diagAnti(2 * n + 3, 0);
 
-    std::sort(positions.begin(), positions.end(), [](const Position &lhs, const Position &rhs) {
-        return lhs.notation < rhs.notation;
-    });
-
-    std::vector<char> rowUsed(n + 1, 0);
-    std::vector<char> colUsed(n + 1, 0);
-    std::vector<char> diagMain(2 * n + 3, 0);
-    std::vector<char> diagAnti(2 * n + 3, 0);
-
-    std::vector<Position> processed;
+    std::vector<std::pair<int, int>> processed;
     processed.reserve(n);
     std::unordered_map<LineKey, int, LineHash> linePairs;
     linePairs.reserve(static_cast<std::size_t>(n) * (n - 1) / 2);
 
-    for (const auto &pos : positions) {
-        if (rowUsed[pos.row]) {
-            return {false, "Row conflict detected while scanning " + pos.notation};
+    for (int col = 0; col < n; ++col) {
+        int row = rowsPerColumn[col];
+        if (row < 0 || row >= n) {
+            return {false, "Row out of bounds at column " + std::to_string(col + 1)};
         }
-        rowUsed[pos.row] = 1;
+        if (rowUsed[row]) return {false, "Row conflict at row " + std::to_string(row + 1)};
+        if (colUsed[col]) return {false, "Column conflict at column " + std::to_string(col + 1)};
+        rowUsed[row] = colUsed[col] = 1;
 
-        if (colUsed[pos.col]) {
-            return {false, "Column conflict detected while scanning " + pos.notation};
-        }
-        colUsed[pos.col] = 1;
-
-        int mainIdx = pos.row + pos.col;
-        if (diagMain[mainIdx]) {
-            return {false, "Main diagonal conflict triggered by " + pos.notation};
-        }
-        diagMain[mainIdx] = 1;
-
-        int antiIdx = pos.row - pos.col + n;
-        if (diagAnti[antiIdx]) {
-            return {false, "Anti-diagonal conflict triggered by " + pos.notation};
-        }
-        diagAnti[antiIdx] = 1;
+        int mainIdx = row + col;
+        int antiIdx = row - col + n;
+        if (diagMain[mainIdx]) return {false, "Main diagonal conflict"};
+        if (diagAnti[antiIdx]) return {false, "Anti-diagonal conflict"};
+        diagMain[mainIdx] = diagAnti[antiIdx] = 1;
 
         for (const auto &prev : processed) {
-            LineKey key = makeLineKey(pos.row, pos.col, prev.row, prev.col);
+            LineKey key = makeLineKey(row, col, prev.first, prev.second);
             auto it = linePairs.find(key);
             if (it != linePairs.end() && it->second > 0) {
-                return {false, "Collinear trio detected via " + prev.notation + " and " + pos.notation};
+                return {false, "Collinear trio detected"};
             }
         }
-
         for (const auto &prev : processed) {
-            LineKey key = makeLineKey(pos.row, pos.col, prev.row, prev.col);
+            LineKey key = makeLineKey(row, col, prev.first, prev.second);
             linePairs[key] += 1;
         }
-        processed.push_back(pos);
+        processed.emplace_back(row, col);
     }
-    return {true, "Validated"};
+    return {true, "ok"};
 }
 
-long long pairPenalty(int pairs) {
-    return (pairs >= 3) ? (pairs - 2) : 0;
-}
-
-void incrementLine(std::unordered_map<LineKey, int, LineHash> &linePairs,
-                   const LineKey &key, long long &cost) {
-    auto it = linePairs.find(key);
-    int before = 0;
-    if (it == linePairs.end()) {
-        linePairs.emplace(key, 1);
-    } else {
-        before = it->second;
-        it->second = before + 1;
+class Solver {
+public:
+    Solver(int n, std::uint64_t seed) : n(n), rng(seed) {
+        initializeStructures();
+        seedInitialPlacement();
+        initialized = true;
     }
-    int after = before + 1;
-    cost += pairPenalty(after) - pairPenalty(before);
-}
 
-void decrementLine(std::unordered_map<LineKey, int, LineHash> &linePairs,
-                   const LineKey &key, long long &cost) {
-    auto it = linePairs.find(key);
-    if (it == linePairs.end()) return;
-    int before = it->second;
-    int after = before - 1;
-    cost += pairPenalty(after) - pairPenalty(before);
-    if (after == 0) {
-        linePairs.erase(it);
-    } else {
-        it->second = after;
-    }
-}
-
-void initializeLineStructures(const std::vector<int> &perm,
-                              std::vector<LineKey> &pairKeys,
-                              std::unordered_map<LineKey, int, LineHash> &linePairs,
-                              long long &cost) {
-    const int n = static_cast<int>(perm.size());
-    pairKeys.assign(static_cast<std::size_t>(n) * n, LineKey{});
-    linePairs.clear();
-    linePairs.reserve(static_cast<std::size_t>(n) * (n - 1) / 2);
-    cost = 0;
-    for (int i = 0; i < n; ++i) {
-        for (int j = i + 1; j < n; ++j) {
-            LineKey key = makeLineKey(i + 1, perm[i] + 1, j + 1, perm[j] + 1);
-            std::size_t idx = static_cast<std::size_t>(i) * n + j;
-            pairKeys[idx] = key;
-            incrementLine(linePairs, key, cost);
-        }
-    }
-}
-
-struct PairDelta {
-    std::size_t index;
-    LineKey oldKey;
-    LineKey newKey;
-};
-
-struct SearchConfig {
-    int maxRestarts;
-    int maxIterations;
-};
-
-int swapScore(int n, int r1, int c1, int r2, int c2,
-              const std::vector<int> &diagMain, const std::vector<int> &diagAnti) {
-    const int offset = n - 1;
-    auto diagIdx = [](int row, int col) { return row + col; };
-    auto antiIdx = [offset](int row, int col) { return row - col + offset; };
-
-    auto conflictsAfter = [&](int row, int newCol) {
-        int dMain = diagIdx(row, newCol);
-        int dAnti = antiIdx(row, newCol);
-        int conflicts = diagMain[dMain] + diagAnti[dAnti];
-        if (dMain == diagIdx(r1, c1)) conflicts--;
-        if (dMain == diagIdx(r2, c2)) conflicts--;
-        if (dAnti == antiIdx(r1, c1)) conflicts--;
-        if (dAnti == antiIdx(r2, c2)) conflicts--;
-        return conflicts;
-    };
-
-    return conflictsAfter(r1, c2) + conflictsAfter(r2, c1);
-}
-
-bool attemptSolve(std::vector<int> perm, Random123Rng &rng, int maxIterations, std::vector<int> &out) {
-    const int n = static_cast<int>(perm.size());
-    std::vector<int> diagMain(2 * n, 0), diagAnti(2 * n, 0);
-    auto diagIdx = [](int row, int col) { return row + col; };
-    auto antiIdx = [offset = n - 1](int row, int col) { return row - col + offset; };
-
-    auto rebuildDiagonals = [&]() {
-        std::fill(diagMain.begin(), diagMain.end(), 0);
-        std::fill(diagAnti.begin(), diagAnti.end(), 0);
-        for (int row = 0; row < n; ++row) {
-            diagMain[diagIdx(row, perm[row])]++;
-            diagAnti[antiIdx(row, perm[row])]++;
-        }
-    };
-
-    rebuildDiagonals();
-
-    std::vector<int> rowConflicts(n, 0);
-    auto recomputeConflicts = [&]() {
-        for (int row = 0; row < n; ++row) {
-            int mainConf = diagMain[diagIdx(row, perm[row])] - 1;
-            int antiConf = diagAnti[antiIdx(row, perm[row])] - 1;
-            rowConflicts[row] = mainConf + antiConf;
-        }
-    };
-
-    recomputeConflicts();
-    int stagnation = 0;
-
-    for (int iter = 0; iter < maxIterations; ++iter) {
-        std::vector<int> conflictRows;
-        conflictRows.reserve(n);
-        for (int row = 0; row < n; ++row) {
-            if (rowConflicts[row] > 0) conflictRows.push_back(row);
-        }
-        if (conflictRows.empty()) {
-            out = perm;
-            return true;
-        }
-
-        int r1 = conflictRows[rng() % conflictRows.size()];
-        int c1 = perm[r1];
-        int bestRow = -1;
-        int bestScore = std::numeric_limits<int>::max();
-        for (int r2 = 0; r2 < n; ++r2) {
-            if (r2 == r1) continue;
-            int candidateScore = swapScore(n, r1, c1, r2, perm[r2], diagMain, diagAnti);
-            if (candidateScore < bestScore) {
-                bestScore = candidateScore;
-                bestRow = r2;
+    bool solve(int maxIter = -1, std::atomic<bool> *stop = nullptr) {
+        int iter = 0;
+        while (!solved()) {
+            if (stop && stop->load(std::memory_order_relaxed)) {
+                return false;
             }
+            if (maxIter >= 0 && iter == maxIter) {
+                return false;
+            }
+
+            calculatePlacementOptions();
+            if (changableColumns.empty()) {
+                return false;
+            }
+
+            int col = getChangableCol();
+            revalidate(col);
+            int row = getPlacement(col);
+            rows[col] = row;
+            invalidate(col);
+            ++iter;
+        }
+        return true;
+    }
+
+    std::vector<int> getSolution() const { return rows; }
+
+private:
+    int n;
+    std::mt19937 rng;
+
+    std::vector<std::vector<int>> numConflicts;
+    std::vector<std::vector<std::pair<int, int>>> simpleInvalidations;
+    std::vector<std::vector<std::vector<std::pair<int, int>>>> colinearInvalidations;
+
+    std::vector<int> rows;
+    std::vector<std::vector<int>> placementOptions;
+    std::vector<int> changableColumns;
+    bool initialized{false};
+
+    void initializeStructures() {
+        numConflicts.assign(n, std::vector<int>(n, 0));
+        simpleInvalidations.assign(n, std::vector<std::pair<int, int>>());
+        colinearInvalidations.assign(n,
+                                     std::vector<std::vector<std::pair<int, int>>>(n));
+        placementOptions.assign(n, std::vector<int>());
+        rows.assign(n, n * 2 - 1);
+    }
+
+    void seedInitialPlacement() {
+        std::uniform_int_distribution<int> dist(0, n - 1);
+        for (int col = 0; col < n; col++) {
+            rows[col] = dist(rng);
+            revalidate(col);
+            invalidate(col);
+        }
+    }
+
+    void invalidateSpot(int row, int col, int originalColumn) {
+        numConflicts[row][col] += 1;
+        simpleInvalidations[originalColumn].push_back(std::make_pair(row, col));
+    }
+
+    void invalidateSimple(int col) {
+        int row = rows[col];
+        for (int i = 0; i < col; i++) {
+            invalidateSpot(row, i, col);
+        }
+        for (int i = col + 1; i < n; i++) {
+            invalidateSpot(row, i, col);
+        }
+        for (int i = 1; row + i < n && col + i < n; i++) {
+            invalidateSpot(row + i, col + i, col);
+        }
+        for (int i = 1; 0 <= row - i && col + i < n; i++) {
+            invalidateSpot(row - i, col + i, col);
+        }
+        for (int i = 1; row + i < n && 0 <= col - i; i++) {
+            invalidateSpot(row + i, col - i, col);
+        }
+        for (int i = 1; 0 <= row - i && 0 <= col - i; i++) {
+            invalidateSpot(row - i, col - i, col);
+        }
+    }
+
+    void invalidateColinearPair(int col1, int col2) {
+        int row1 = rows[col1];
+        int row2 = rows[col2];
+        int rowStep = row2 - row1;
+        int colStep = col2 - col1;
+        int g = std::abs(std::gcd(rowStep, colStep));
+        rowStep /= g;
+        colStep /= g;
+
+        if (row1 == n * 2 - 1) {
+            if (row2 != n * 2 - 1) {
+                numConflicts[row2][col2] += 1;
+                colinearInvalidations[col1][col2].push_back(std::make_pair(row2, col2));
+            }
+            return;
         }
 
-        if (bestRow == -1) {
-            std::shuffle(perm.begin(), perm.end(), rng);
-            rebuildDiagonals();
-            recomputeConflicts();
-            stagnation = 0;
-            continue;
-        }
-
-        int previousCombined = rowConflicts[r1] + rowConflicts[bestRow];
-        int r2 = bestRow;
-        int c2 = perm[r2];
-
-        diagMain[diagIdx(r1, c1)]--;
-        diagAnti[antiIdx(r1, c1)]--;
-        diagMain[diagIdx(r2, c2)]--;
-        diagAnti[antiIdx(r2, c2)]--;
-
-        std::swap(perm[r1], perm[r2]);
-        c1 = perm[r1];
-        c2 = perm[r2];
-
-        diagMain[diagIdx(r1, c1)]++;
-        diagAnti[antiIdx(r1, c1)]++;
-        diagMain[diagIdx(r2, c2)]++;
-        diagAnti[antiIdx(r2, c2)]++;
-
-        recomputeConflicts();
-
-        if (bestScore >= previousCombined) {
-            stagnation++;
+        int row;
+        int col;
+        if (rowStep > 0) {
+            row = row1;
+            col = col1;
+            while (col < n && row < n) {
+                numConflicts[row][col] += 1;
+                colinearInvalidations[col1][col2].push_back(std::make_pair(row, col));
+                row += rowStep;
+                col += colStep;
+            }
+            row = row1 - rowStep;
+            col = col1 - colStep;
+            while (0 <= col && 0 <= row) {
+                numConflicts[row][col] += 1;
+                colinearInvalidations[col1][col2].push_back(std::make_pair(row, col));
+                row -= rowStep;
+                col -= colStep;
+            }
         } else {
-            stagnation = 0;
-        }
-        if (stagnation > n) {
-            std::shuffle(perm.begin(), perm.end(), rng);
-            rebuildDiagonals();
-            recomputeConflicts();
-            stagnation = 0;
-        }
-    }
-    return false;
-}
-
-bool solveQueens(int n, Random123Rng &rng, const SearchConfig &config, std::vector<int> &out) {
-    std::vector<int> base(n);
-    std::iota(base.begin(), base.end(), 0);
-    for (int attempt = 0; attempt < config.maxRestarts; ++attempt) {
-        std::shuffle(base.begin(), base.end(), rng);
-        std::vector<int> candidate = base;
-        if (attemptSolve(candidate, rng, config.maxIterations, out)) {
-            return true;
+            row = row1;
+            col = col1;
+            while (col < n && 0 <= row) {
+                numConflicts[row][col] += 1;
+                colinearInvalidations[col1][col2].push_back(std::make_pair(row, col));
+                row += rowStep;
+                col += colStep;
+            }
+            row = row1 - rowStep;
+            col = col1 - colStep;
+            while (0 <= col && row < n) {
+                numConflicts[row][col] += 1;
+                colinearInvalidations[col1][col2].push_back(std::make_pair(row, col));
+                row -= rowStep;
+                col -= colStep;
+            }
         }
     }
-    return false;
-}
 
-bool enforceCollinearity(std::vector<int> &perm, Random123Rng &rng, int multiplier = 40) {
-    const int n = static_cast<int>(perm.size());
-    std::vector<int> diagMain(2 * n, -1);
-    std::vector<int> diagAnti(2 * n, -1);
-    auto mainIdx = [](int row, int col) { return row + col; };
-    auto antiIdx = [offset = n - 1](int row, int col) { return row - col + offset; };
-    for (int row = 0; row < n; ++row) {
-        diagMain[mainIdx(row, perm[row])] = row;
-        diagAnti[antiIdx(row, perm[row])] = row;
+    void invalidateColinear(int col) {
+        for (int i = 0; i < col; i++) {
+            invalidateColinearPair(i, col);
+        }
+        for (int i = col + 1; i < n; i++) {
+            invalidateColinearPair(col, i);
+        }
+        numConflicts[rows[col]][col] -= n - 1;
     }
 
-    std::vector<int> colOwner(n, -1);
-    for (int row = 0; row < n; ++row) {
-        colOwner[perm[row]] = row;
+    void invalidate(int col) {
+        invalidateSimple(col);
+        invalidateColinear(col);
     }
 
-    std::vector<LineKey> pairKeys;
-    std::unordered_map<LineKey, int, LineHash> linePairs;
-    long long cost = 0;
-    initializeLineStructures(perm, pairKeys, linePairs, cost);
-    if (cost == 0) {
+    void revalidateSimple(int col) {
+        for (const auto &spot : simpleInvalidations[col]) {
+            numConflicts[spot.first][spot.second] -= 1;
+        }
+        simpleInvalidations[col].clear();
+    }
+
+    void revalidateColinear(int col) {
+        for (int i = 0; i < col; i++) {
+            for (auto spot : colinearInvalidations[i][col]) {
+                numConflicts[spot.first][spot.second] -= 1;
+            }
+            colinearInvalidations[i][col].clear();
+        }
+
+        for (int i = col + 1; i < n; i++) {
+            for (auto spot : colinearInvalidations[col][i]) {
+                numConflicts[spot.first][spot.second] -= 1;
+            }
+            colinearInvalidations[col][i].clear();
+        }
+
+        if (initialized) {
+            numConflicts[rows[col]][col] += n - 1;
+        }
+    }
+
+    void revalidate(int col) {
+        revalidateSimple(col);
+        revalidateColinear(col);
+    }
+
+    void calculatePlacementOptions(int col) {
+        placementOptions[col].clear();
+        placementOptions[col].push_back(0);
+        int minConflicts = numConflicts[0][col];
+        for (int row = 1; row < n; row++) {
+            int conflicts = numConflicts[row][col];
+            if (conflicts < minConflicts) {
+                placementOptions[col].clear();
+                minConflicts = conflicts;
+                placementOptions[col].push_back(row);
+            } else if (conflicts == minConflicts) {
+                placementOptions[col].push_back(row);
+            }
+        }
+    }
+
+    void calculatePlacementOptions() {
+        changableColumns.clear();
+        for (int col = 0; col < n; col++) {
+            calculatePlacementOptions(col);
+            if (placementOptions[col].size() > 1 || placementOptions[col][0] != rows[col]) {
+                changableColumns.push_back(col);
+            }
+        }
+    }
+
+    int getChangableCol() {
+        std::uniform_int_distribution<int> dist(0,
+                                                static_cast<int>(changableColumns.size()) - 1);
+        return changableColumns[dist(rng)];
+    }
+
+    int getPlacement(int col) {
+        std::uniform_int_distribution<int> dist(0,
+                                                static_cast<int>(placementOptions[col].size()) - 1);
+        return placementOptions[col][dist(rng)];
+    }
+
+    bool solved() {
+        for (int col = 0; col < n; col++) {
+            if (numConflicts[rows[col]][col] != 0) {
+                return false;
+            }
+        }
         return true;
     }
+};
 
-    const long long maxSteps = static_cast<long long>(n) * n * multiplier;
-    auto diagFreeAfterSwap = [&](int row, int newCol, int allowedRow) {
-        int idxMain = mainIdx(row, newCol);
-        int idxAnti = antiIdx(row, newCol);
-        if (diagMain[idxMain] != -1 && diagMain[idxMain] != allowedRow) return false;
-        if (diagAnti[idxAnti] != -1 && diagAnti[idxAnti] != allowedRow) return false;
-        return true;
-    };
+struct RunConfig {
+    int n = 999;
+    int maxIter = -1;
+    int threads = 0;
+};
 
-    auto trySwap = [&](int rowA, int rowB, double temperature) {
-        if (rowA == rowB) return false;
-        int colA = perm[rowA];
-        int colB = perm[rowB];
-        if (!diagFreeAfterSwap(rowA, colB, rowB)) return false;
-        if (!diagFreeAfterSwap(rowB, colA, rowA)) return false;
-
-        long long beforeCost = cost;
-
-        // Remove old diagonals
-        diagMain[mainIdx(rowA, colA)] = -1;
-        diagAnti[antiIdx(rowA, colA)] = -1;
-        diagMain[mainIdx(rowB, colB)] = -1;
-        diagAnti[antiIdx(rowB, colB)] = -1;
-
-        std::vector<PairDelta> deltas;
-        deltas.reserve(static_cast<std::size_t>(n) * 2);
-
-        auto updatePair = [&](int x, int y) {
-            if (x > y) std::swap(x, y);
-            std::size_t idx = static_cast<std::size_t>(x) * n + y;
-            LineKey oldKey = pairKeys[idx];
-            decrementLine(linePairs, oldKey, cost);
-            LineKey newKey = makeLineKey(x + 1, perm[x] + 1, y + 1, perm[y] + 1);
-            incrementLine(linePairs, newKey, cost);
-            pairKeys[idx] = newKey;
-            deltas.push_back({idx, oldKey, newKey});
-        };
-
-        std::swap(perm[rowA], perm[rowB]);
-        colOwner[perm[rowA]] = rowA;
-        colOwner[perm[rowB]] = rowB;
-        diagMain[mainIdx(rowA, perm[rowA])] = rowA;
-        diagAnti[antiIdx(rowA, perm[rowA])] = rowA;
-        diagMain[mainIdx(rowB, perm[rowB])] = rowB;
-        diagAnti[antiIdx(rowB, perm[rowB])] = rowB;
-
-        for (int k = 0; k < n; ++k) {
-            if (k == rowA || k == rowB) continue;
-            updatePair(rowA, k);
-            updatePair(rowB, k);
-        }
-        updatePair(rowA, rowB);
-
-        long long afterCost = cost;
-        bool accept = (afterCost <= beforeCost);
-        if (!accept && temperature > 0.0) {
-            double p = std::exp(static_cast<double>(beforeCost - afterCost) /
-                                std::max(temperature, 1e-9));
-            if (rng.uniform01() < p) accept = true;
-        }
-
-        if (!accept) {
-            for (auto it = deltas.rbegin(); it != deltas.rend(); ++it) {
-                decrementLine(linePairs, it->newKey, cost);
-                incrementLine(linePairs, it->oldKey, cost);
-                pairKeys[it->index] = it->oldKey;
+static RunConfig parseArgs(int argc, char *argv[]) {
+    RunConfig cfg;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--threads" && i + 1 < argc) {
+            cfg.threads = std::max(1, std::stoi(argv[++i]));
+        } else if (arg == "--max-iter" && i + 1 < argc) {
+            cfg.maxIter = std::stoi(argv[++i]);
+        } else {
+            try {
+                cfg.n = std::stoi(arg);
+            } catch (...) {
+                std::cerr << "Ignoring invalid argument: " << arg << '\n';
             }
-            diagMain[mainIdx(rowA, perm[rowA])] = -1;
-            diagAnti[antiIdx(rowA, perm[rowA])] = -1;
-            diagMain[mainIdx(rowB, perm[rowB])] = -1;
-            diagAnti[antiIdx(rowB, perm[rowB])] = -1;
-            std::swap(perm[rowA], perm[rowB]);
-            colOwner[colA] = rowA;
-            colOwner[colB] = rowB;
-            diagMain[mainIdx(rowA, colA)] = rowA;
-            diagAnti[antiIdx(rowA, colA)] = rowA;
-            diagMain[mainIdx(rowB, colB)] = rowB;
-            diagAnti[antiIdx(rowB, colB)] = rowB;
-            cost = beforeCost;
-            return false;
-        }
-        return true;
-    };
-
-    std::vector<int> conflictRows;
-    std::vector<char> conflictMarks(n, 0);
-    std::vector<char> forbiddenCols(n, 0);
-    auto refreshConflictRows = [&]() {
-        std::fill(conflictMarks.begin(), conflictMarks.end(), 0);
-        conflictRows.clear();
-        for (const auto &entry : linePairs) {
-            if (entry.second < 3) continue;
-            const auto &key = entry.first;
-            for (int row = 0; row < n; ++row) {
-                if (conflictMarks[row]) continue;
-                long long lhs = 1LL * key.a * (row + 1) + 1LL * key.b * (perm[row] + 1) + key.c;
-                if (lhs == 0) {
-                    conflictMarks[row] = 1;
-                    conflictRows.push_back(row);
-                }
-            }
-        }
-    };
-
-    refreshConflictRows();
-
-    auto markForbidden = [&](int row) {
-        std::fill(forbiddenCols.begin(), forbiddenCols.end(), 0);
-        for (const auto &entry : linePairs) {
-            if (entry.second < 3) continue;
-            const auto &key = entry.first;
-            long long numerator = -1LL * key.a * (row + 1) - key.c;
-            long long denom = key.b;
-            if (numerator % denom != 0) continue;
-            long long col = numerator / denom - 1;
-            if (col >= 0 && col < n) {
-                forbiddenCols[static_cast<std::size_t>(col)] = 1;
-            }
-        }
-        forbiddenCols[perm[row]] = 1;
-    };
-
-    auto targetedSwap = [&](int rowA, double temperature) {
-        markForbidden(rowA);
-        for (int attempt = 0; attempt < n / 2 + 1; ++attempt) {
-            int col = rng() % n;
-            if (forbiddenCols[col]) continue;
-            int rowB = colOwner[col];
-            if (rowA == rowB) continue;
-            if (trySwap(rowA, rowB, temperature)) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    for (long long step = 0; step < maxSteps; ++step) {
-        if (cost == 0) return true;
-        if (conflictRows.empty()) {
-            refreshConflictRows();
-            if (conflictRows.empty()) {
-                return cost == 0;
-            }
-        }
-        double temperature = 1.0 - static_cast<double>(step) / maxSteps;
-        int rowA = conflictRows[rng() % conflictRows.size()];
-        bool improved = targetedSwap(rowA, temperature);
-        if (!improved) {
-            int rowB = rng() % n;
-            if (rowA != rowB) {
-                improved = trySwap(rowA, rowB, temperature);
-            }
-        }
-        if (improved) {
-            refreshConflictRows();
         }
     }
-    refreshConflictRows();
-    return cost == 0 && conflictRows.empty();
+    if (cfg.n < 4) {
+        cfg.n = 4;
+    }
+    if (cfg.threads <= 0) {
+        unsigned int hw = std::thread::hardware_concurrency();
+        cfg.threads = hw ? static_cast<int>(hw) : 2;
+    }
+    return cfg;
 }
 
-void searchWorker(int workerId, int n, const SearchConfig &config,
-                  bool skipCollinearity, std::uint64_t seedBase,
-                  std::atomic<bool> &solved, std::vector<int> &solution,
-                  std::mutex &solutionMutex, std::atomic<std::uint64_t> &attempts) {
-    constexpr std::uint64_t kStreamSpacing = 0x9e3779b97f4a7c15ull;
-    std::uint64_t workerSeed = seedBase + kStreamSpacing * static_cast<std::uint64_t>(workerId);
-    Random123Rng rng(workerSeed, static_cast<std::uint64_t>(workerId));
-    while (!solved.load(std::memory_order_relaxed)) {
-        std::vector<int> perm;
-        if (!solveQueens(n, rng, config, perm)) {
-            continue;
-        }
-        if (!skipCollinearity) {
-            if (!enforceCollinearity(perm, rng)) {
-                continue;
-            }
-        }
-        attempts.fetch_add(1, std::memory_order_relaxed);
-        if (!skipCollinearity) {
-            auto result = validatePermutation(perm);
-            if (!result.ok) {
-                continue;
-            }
-        }
+struct SharedState {
+    std::atomic<bool> done{false};
+    std::vector<int> solution;
+    std::mutex mtx;
+};
+
+static void worker(int id, const RunConfig &cfg, SharedState &state) {
+    std::mt19937_64 seeder(std::random_device{}() ^ (static_cast<std::uint64_t>(id) << 16));
+    while (!state.done.load(std::memory_order_relaxed)) {
+        Solver solver(cfg.n, seeder());
+        bool ok = solver.solve(cfg.maxIter, &state.done);
+        if (!ok) continue;
+
+        auto sol = solver.getSolution();
+        auto res = validatePlacement(sol);
+        if (!res.ok) continue;
+
         bool expected = false;
-        if (solved.compare_exchange_strong(expected, true)) {
-            std::lock_guard<std::mutex> guard(solutionMutex);
-            solution = std::move(perm);
+        if (state.done.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lock(state.mtx);
+            state.solution = std::move(sol);
         }
         return;
     }
 }
 
 int main(int argc, char *argv[]) {
-    int N = 999;
-    bool skipCollinearity = false;
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--skip-collinear" || arg == "--skip-collinearity") {
-            skipCollinearity = true;
-        } else {
-            try {
-                N = std::stoi(arg);
-            } catch (...) {
-                std::cerr << "Ignoring invalid argument: " << arg << '\n';
-            }
-        }
+    RunConfig cfg = parseArgs(argc, argv);
+    SharedState state;
+    state.solution.assign(cfg.n, -1);
+
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(cfg.threads));
+
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < cfg.threads; ++i) {
+        threads.emplace_back(worker, i, std::cref(cfg), std::ref(state));
     }
-    if (skipCollinearity) {
-        std::cerr << "[warn] Skipping collinearity validation; use only for diagnostics." << std::endl;
-    }
-    if (N < 4) {
-        std::cerr << "N must be at least 4." << std::endl;
+    for (auto &t : threads) t.join();
+    auto stop = std::chrono::steady_clock::now();
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start).count();
+
+    if (!state.done.load()) {
+        std::cerr << "Failed to find a solution for N=" << cfg.n << '\n';
         return 1;
     }
 
-    SearchConfig config;
-    config.maxRestarts = 64;
-    config.maxIterations = N * 12;
-
-    std::atomic<bool> solved{false};
-    std::atomic<std::uint64_t> attempts{0};
-    std::vector<int> solution;
-    std::mutex solutionMutex;
-
-    const unsigned int hw = std::thread::hardware_concurrency();
-    const unsigned int numThreads = std::max(2u, hw == 0 ? 2u : hw);
-
-    auto deriveSeed = []() {
-        std::random_device rd;
-        std::uint64_t hi = static_cast<std::uint64_t>(rd()) << 32;
-        std::uint64_t lo = static_cast<std::uint64_t>(rd());
-        std::uint64_t timeComponent =
-            static_cast<std::uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-        std::uint64_t seed = hi ^ lo ^ timeComponent;
-        if (seed == 0) seed = 0x123456789abcdefULL;
-        return seed;
-    };
-    const std::uint64_t seedBase = deriveSeed();
-
-    std::vector<std::thread> workers;
-    workers.reserve(numThreads);
-
-    auto start = std::chrono::steady_clock::now();
-    for (unsigned int i = 0; i < numThreads; ++i) {
-        workers.emplace_back(searchWorker, static_cast<int>(i), N, std::cref(config),
-                             skipCollinearity, seedBase,
-                             std::ref(solved), std::ref(solution), std::ref(solutionMutex), std::ref(attempts));
-    }
-    for (auto &t : workers) {
-        t.join();
-    }
-    auto stop = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start).count();
-
-    if (!solved.load()) {
-        std::cerr << "Failed to find a valid configuration for N=" << N << std::endl;
-        return 2;
+    std::vector<int> colsPerRow(cfg.n, -1);
+    for (int col = 0; col < cfg.n; ++col) {
+        int row = state.solution[col];
+        if (row >= 0 && row < cfg.n) {
+            colsPerRow[row] = col;
+        }
     }
 
-    std::cerr << "Solved N=" << N << " in " << elapsed << " ms after "
-              << attempts.load() << " validated permutations." << std::endl;
+    std::cerr << "Solved N=" << cfg.n << " in " << elapsedMs << " ms using "
+              << cfg.threads << " threads\n";
 
-    std::cout << N << '\n';
-    for (int row = 0; row < N; ++row) {
+    std::cout << cfg.n << '\n';
+    for (int row = 0; row < cfg.n; ++row) {
         if (row) std::cout << ' ';
-        std::cout << solution[row] + 1;
+        std::cout << colsPerRow[row] + 1;
     }
     std::cout << '\n';
     return 0;
