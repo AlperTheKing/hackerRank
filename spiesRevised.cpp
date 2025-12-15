@@ -309,7 +309,7 @@ int main(int argc, char** argv) {
 
     unsigned hw = std::thread::hardware_concurrency();
     int threads = (hw ? (int)hw : 4);
-    threads = std::min(threads, 8);
+    threads = std::min(threads, 16);
     if (argc >= 3) {
         try {
             threads = max(1, stoi(argv[2]));
