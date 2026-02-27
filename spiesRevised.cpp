@@ -1,16 +1,18 @@
-#include <iostream>
-#include <vector>
-#include <thread>
 #include <atomic>
-#include <mutex>
-#include <random>
-#include <numeric>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iostream>
 #include <limits>
+#include <mutex>
+#include <numeric>
+#include <random>
+#include <thread>
+#include <vector>
 
 using namespace std;
+
+static constexpr int kMaxStepsPerRestart = 200000;
 
 struct SpinBarrier {
     int total;
@@ -34,17 +36,24 @@ public:
         : n_(n),
           UNASSIGNED_(2 * n - 1),
           initialized_(false),
-          conflicts_(n, vector<int>(n, 0)),          // conflicts_[col][row]
+          conflicts_(n, vector<int>(n, 0)),
           simpleInv_(n),
           colInv_(n),
           rowOfCol_(n, UNASSIGNED_),
-          rng_(seed32(seed)) {
-
+          rng_(seed32(seed)),
+          bestRows_(),
+          worstCols_(),
+          candidates_(),
+          secondCandidates_() {
         for (int c = 0; c < n_; ++c) simpleInv_[c].reserve(3 * n_);
         for (int i = 0; i < n_; ++i) {
             int len = n_ - i - 1;
             if (len > 0) colInv_[i].resize(len);
         }
+        bestRows_.reserve(n_);
+        worstCols_.reserve(n_);
+        candidates_.reserve(n_);
+        secondCandidates_.reserve(n_);
         greedyInitialize();
     }
 
@@ -59,24 +68,22 @@ public:
         fill(rowOfCol_.begin(), rowOfCol_.end(), UNASSIGNED_);
         initialized_ = false;
 
-        vector<int> bestRows;
-        bestRows.reserve(n_);
         for (int col = 0; col < n_; ++col) {
             revalidate(col);
 
             int best = numeric_limits<int>::max();
-            bestRows.clear();
+            bestRows_.clear();
             for (int row = 0; row < n_; ++row) {
                 int c = conflicts_[col][row];
                 if (c < best) {
                     best = c;
-                    bestRows.clear();
-                    bestRows.push_back(row);
+                    bestRows_.clear();
+                    bestRows_.push_back(row);
                 } else if (c == best) {
-                    bestRows.push_back(row);
+                    bestRows_.push_back(row);
                 }
             }
-            int chosen = bestRows[randIndex((int)bestRows.size())];
+            int chosen = bestRows_[randIndex((int)bestRows_.size())];
             rowOfCol_[col] = chosen;
             invalidate(col);
         }
@@ -92,62 +99,54 @@ public:
         return true;
     }
 
-    bool solve(int maxSteps, atomic<bool>* stopFlag, uint64_t* stepsDone) {
-        vector<int> worstCols;
-        worstCols.reserve(n_);
-        vector<int> candidates;
-        candidates.reserve(n_);
-        vector<int> secondCandidates;
-        secondCandidates.reserve(n_);
-
+    bool solve(int maxSteps, atomic<bool> &stopFlag) {
         for (int step = 0; step < maxSteps; ++step) {
-            if (stepsDone) ++(*stepsDone);
-            if (stopFlag && stopFlag->load(memory_order_relaxed)) return false;
+            if (stopFlag.load(memory_order_relaxed)) return false;
 
             int maxConf = 0;
-            worstCols.clear();
+            worstCols_.clear();
             for (int col = 0; col < n_; ++col) {
                 int c = conflicts_[col][rowOfCol_[col]];
                 if (c > maxConf) {
                     maxConf = c;
-                    worstCols.clear();
-                    if (c > 0) worstCols.push_back(col);
+                    worstCols_.clear();
+                    if (c > 0) worstCols_.push_back(col);
                 } else if (c == maxConf && c > 0) {
-                    worstCols.push_back(col);
+                    worstCols_.push_back(col);
                 }
             }
             if (maxConf == 0) return true;
 
-            int col = worstCols[randIndex((int)worstCols.size())];
+            int col = worstCols_[randIndex((int)worstCols_.size())];
             int curRow = rowOfCol_[col];
 
             int minC = numeric_limits<int>::max();
             for (int row = 0; row < n_; ++row) minC = min(minC, conflicts_[col][row]);
 
-            candidates.clear();
+            candidates_.clear();
             for (int row = 0; row < n_; ++row) {
-                if (conflicts_[col][row] == minC) candidates.push_back(row);
+                if (conflicts_[col][row] == minC) candidates_.push_back(row);
             }
 
             int newRow = curRow;
-            if ((int)candidates.size() == 1 && candidates[0] == curRow && minC > 0) {
+            if ((int)candidates_.size() == 1 && candidates_[0] == curRow && minC > 0) {
                 int second = numeric_limits<int>::max();
                 for (int row = 0; row < n_; ++row) {
                     if (row == curRow) continue;
                     second = min(second, conflicts_[col][row]);
                 }
-                secondCandidates.clear();
+                secondCandidates_.clear();
                 for (int row = 0; row < n_; ++row) {
                     if (row == curRow) continue;
-                    if (conflicts_[col][row] == second) secondCandidates.push_back(row);
+                    if (conflicts_[col][row] == second) secondCandidates_.push_back(row);
                 }
-                if (!secondCandidates.empty()) {
-                    newRow = secondCandidates[randIndex((int)secondCandidates.size())];
+                if (!secondCandidates_.empty()) {
+                    newRow = secondCandidates_[randIndex((int)secondCandidates_.size())];
                 } else {
                     newRow = (curRow + 1 + randIndex(n_ - 1)) % n_;
                 }
             } else {
-                newRow = candidates[randIndex((int)candidates.size())];
+                newRow = candidates_[randIndex((int)candidates_.size())];
             }
 
             if (newRow != curRow) {
@@ -159,7 +158,7 @@ public:
         return solved();
     }
 
-    const vector<int>& rowOfCol() const { return rowOfCol_; }
+    const vector<int> &rowOfCol() const { return rowOfCol_; }
 
 private:
     int n_;
@@ -171,6 +170,10 @@ private:
     vector<vector<vector<uint32_t>>> colInv_;
     vector<int> rowOfCol_;
     mt19937 rng_;
+    vector<int> bestRows_;
+    vector<int> worstCols_;
+    vector<int> candidates_;
+    vector<int> secondCandidates_;
 
     static uint32_t seed32(uint64_t s) {
         s ^= (s >> 33);
@@ -297,61 +300,48 @@ private:
     }
 };
 
-int main(int argc, char** argv) {
-    int N = 999;
-    if (argc >= 2) {
-        try {
-            N = max(4, stoi(argv[1]));
-        } catch (...) {
-            N = 999;
-        }
+static vector<int> convertColToRow(const vector<int> &rowOfCol, int n) {
+    vector<int> rowToCol(n, 0);
+    for (int col = 0; col < n; ++col) {
+        int row = rowOfCol[col];
+        if (row >= 0 && row < n) rowToCol[row] = col + 1;
+    }
+    return rowToCol;
+}
+
+int main() {
+    int N;
+    if (!(cin >> N)) return 0;
+
+    if (N < 4 || (N % 2 == 0)) {
+        cerr << "N must be odd and >= 5\n";
+        return 1;
     }
 
-    unsigned hw = std::thread::hardware_concurrency();
-    int threads = (hw ? (int)hw : 4);
-    threads = std::min(threads, 16);
-    if (argc >= 3) {
-        try {
-            threads = max(1, stoi(argv[2]));
-        } catch (...) {
-        }
-    }
-
-    int maxSteps = 200000;
-    if (argc >= 4) {
-        try {
-            maxSteps = max(1000, stoi(argv[3]));
-        } catch (...) {
-        }
-    }
-    bool printStats = (argc >= 5);
+    vector<int> answer;
+    unsigned hw = thread::hardware_concurrency();
+    int threads = hw ? (int)hw : 4;
+    threads = clamp(threads, 2, 8);
 
     atomic<bool> found(false);
     mutex resultMutex;
     vector<int> bestRowOfCol;
 
     SpinBarrier barrier(threads);
-    vector<atomic<uint64_t>> steps(threads);
-    vector<atomic<uint64_t>> restarts(threads);
-    for (int i = 0; i < threads; ++i) {
-        steps[i].store(0);
-        restarts[i].store(0);
-    }
+    vector<thread> pool;
+    pool.reserve((size_t)threads);
 
     auto worker = [&](int id) {
         uint64_t seed =
-            (uint64_t)chrono::high_resolution_clock::now().time_since_epoch().count()
-            ^ (0x9e3779b97f4a7c15ULL * (uint64_t)(id + 1))
-            ^ (((uint64_t)random_device{}() << 32) | (uint64_t)random_device{}());
+            (uint64_t)chrono::high_resolution_clock::now().time_since_epoch().count() ^
+            (0x9e3779b97f4a7c15ULL * (uint64_t)(id + 1)) ^
+            (((uint64_t)random_device{}() << 32) | (uint64_t)random_device{}());
 
         MinConflictSolver solver(N, seed);
         barrier.wait();
 
-        uint64_t localSteps = 0;
-        uint64_t localRestarts = 0;
-
         while (!found.load(memory_order_relaxed)) {
-            if (solver.solve(maxSteps, &found, &localSteps)) {
+            if (solver.solve(kMaxStepsPerRestart, found)) {
                 bool expected = false;
                 if (found.compare_exchange_strong(expected, true, memory_order_acq_rel)) {
                     lock_guard<mutex> lk(resultMutex);
@@ -359,41 +349,24 @@ int main(int argc, char** argv) {
                 }
                 break;
             }
-            ++localRestarts;
+            if (found.load(memory_order_relaxed)) break;
             solver.greedyInitialize();
         }
-
-        steps[id].store(localSteps, memory_order_relaxed);
-        restarts[id].store(localRestarts, memory_order_relaxed);
     };
 
-    vector<thread> pool;
-    pool.reserve((size_t)threads);
     for (int t = 0; t < threads; ++t) pool.emplace_back(worker, t);
     for (auto &th : pool) th.join();
 
     if (bestRowOfCol.empty()) {
-        cerr << "Failed to find a solution for N=" << N << "\n";
+        cerr << "No solution found for N=" << N << "\n";
         return 1;
     }
-
-    if (printStats) {
-        for (int i = 0; i < threads; ++i) {
-            cerr << "thread " << i
-                 << " steps=" << steps[i].load()
-                 << " restarts=" << restarts[i].load() << "\n";
-        }
-    }
+    answer = convertColToRow(bestRowOfCol, N);
 
     cout << N << "\n";
-    vector<int> rowToCol(N, -1);
-    for (int col = 0; col < N; ++col) {
-        int row = bestRowOfCol[col];
-        if (row >= 0 && row < N) rowToCol[row] = col;
-    }
-    for (int row = 0; row < N; ++row) {
-        if (row) cout << ' ';
-        cout << rowToCol[row] + 1;
+    for (int i = 0; i < N; ++i) {
+        if (i) cout << ' ';
+        cout << answer[i];
     }
     cout << "\n";
     return 0;
